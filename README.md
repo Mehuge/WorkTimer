@@ -50,5 +50,5 @@ This is a C# Windows Forms application built on the .NET 8 framework.
 9.  Click the **View Logs** button to open the Log Browser and review past sessions.
 
 ## Authors
-* Coding by Google Gemini prompted by Mehuge
-* Artwork by Google Gemini prompted by Mehuge
+* Coding by Google Gemini 2.5 Pro prompted by Mehuge
+* Artwork by Google Gemini 2.5 Pro prompted by Mehuge
