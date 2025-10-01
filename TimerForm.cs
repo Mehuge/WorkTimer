@@ -5,7 +5,7 @@ using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Media;
-using System.Reflection;
+using System.Text.Json;
 using System.Windows.Forms;
 using System.Windows.Forms.DataVisualization.Charting;
 
@@ -13,54 +13,15 @@ namespace WorkTimer
 {
     public partial class TimerForm : Form
     {
-        #region LogEntry Class
-        public class LogEntry
-        {
-            public DateTime Timestamp { get; set; }
-            public string EventType { get; set; }
-            public string? Details { get; set; }
-            public TimeSpan RemainingTime { get; set; }
-
-            public LogEntry(string eventType, TimeSpan remainingTime, string? details = null)
-            {
-                Timestamp = DateTime.Now;
-                EventType = eventType;
-                RemainingTime = remainingTime;
-                Details = details;
-            }
-
-            public override string ToString()
-            {
-                string time = $"[{Timestamp:HH:mm:ss} | {RemainingTime:hh\\:mm\\:ss}]";
-                return $"{time} {EventType,-15} {Details ?? ""}";
-            }
-
-            public static LogEntry? FromString(string logLine)
-            {
-                try
-                {
-                    // Simple parsing, assumes format is consistent.
-                    var parts = logLine.Split(new[] { ' ' }, 4);
-                    var timestamp = DateTime.Parse(parts[0].Trim('[', ']'));
-                    var remaining = TimeSpan.Parse(parts[1].Trim('[', ']'));
-                    var eventType = parts[2];
-                    var details = parts.Length > 3 ? parts[3] : null;
-
-                    return new LogEntry(eventType, remaining, details) { Timestamp = timestamp };
-                }
-                catch
-                {
-                    return null; // Could not parse line
-                }
-            }
-        }
-        #endregion
+        #region Member Variables
 
         // Core Timer state
         private TimeSpan _totalTime;
         private TimeSpan _remainingTime;
         private bool _isTimerRunning = false;
         private bool _wasAutoPaused = false;
+        private string _currentLogFile = string.Empty;
+        private List<LogEntry> _logEntries = new List<LogEntry>();
 
         // Manual Pause state for auto-unpause logic
         private bool _isManuallyPaused = false;
@@ -69,72 +30,59 @@ namespace WorkTimer
         // Settings (with default values)
         private int _idleSecondsForPause = 300; // 5 minutes
         private int _manualPauseSecondsForAutoResume = 60; // 1 minute
-        private int _keyboardWeight = 10;
-        private int _typingSpeedForMax = 60; // WPM for full meter
+        private int _wpmForFullMeter = 60;
+        private int _opacityValue = 100;
 
-        // Charting
+        // Charting & Absences
         private Dictionary<DateTime, int> _activityData = new Dictionary<DateTime, int>();
-        private List<(DateTime Start, DateTime End)> _absencePeriods = new List<(DateTime, DateTime)>();
-        private DateTime? _currentAbsenceStart = null;
+        private List<(DateTime Start, DateTime End)> _absences = new List<(DateTime, DateTime)>();
         private System.Windows.Forms.Timer? _chartUpdateTimer;
 
         // Real-time Activity Meter
         private GlobalActivityHook _activityHook;
-        private double _currentActivityLevel = 0;
         private System.Windows.Forms.Timer _activityDecayTimer;
+        private double _activityScore = 0;
+        private const double MOUSE_WEIGHT = 0.5;
+        private const double KEYBOARD_WEIGHT = 5.0;
+        private const double ACTIVITY_DECAY_RATE = 0.90;
 
-        // Logging
-        private List<LogEntry> _currentLog = new List<LogEntry>();
-        private string? _currentLogFileName;
+        #endregion
 
         public TimerForm()
         {
             InitializeComponent();
+            _activityDecayTimer = new System.Windows.Forms.Timer();
             InitializeCustomComponents();
-
-            // Setup the global hook
             _activityHook = new GlobalActivityHook();
-            _activityHook.OnActivity += GlobalHook_OnActivity;
-
-            // Setup the decay timer
-            _activityDecayTimer = new System.Windows.Forms.Timer { Interval = 50 }; // Fast decay
-            _activityDecayTimer.Tick += ActivityDecayTimer_Tick;
-            _activityDecayTimer.Start();
+            _activityHook.OnActivity += _activityHook_OnActivity;
         }
 
         private void InitializeCustomComponents()
         {
-            // Form properties
-            this.TopMost = true;
-            this.FormBorderStyle = FormBorderStyle.Sizable;
-            this.Text = "Work Timer";
-            this.BackColor = Color.White;
-
-            // Enable double buffering on custom-drawn panels to prevent flicker
-            typeof(Panel).InvokeMember("DoubleBuffered", BindingFlags.SetProperty | BindingFlags.Instance | BindingFlags.NonPublic, null, progressRingPanel, new object[] { true });
-            typeof(Panel).InvokeMember("DoubleBuffered", BindingFlags.SetProperty | BindingFlags.Instance | BindingFlags.NonPublic, null, activityMeterPanel, new object[] { true });
-
             // Chart setup
             SetupActivityChart();
 
-            // Opacity slider setup
-            opacityTrackBar.Value = (int)(this.Opacity * 100);
-            opacityTrackBar.Scroll += (s, e) => { this.Opacity = opacityTrackBar.Value / 100.0; };
-
-            // Initial state
-            ResetTimerToInput();
-
-            // Handle resizing
-            this.Resize += (s, e) =>
-            {
-                this.progressRingPanel.Invalidate();
-                this.activityMeterPanel.Invalidate();
-            };
-
             // Chart update timer
             _chartUpdateTimer = new System.Windows.Forms.Timer();
-            _chartUpdateTimer.Interval = 5000; // Update chart every 5 seconds
+            _chartUpdateTimer.Interval = 5000;
             _chartUpdateTimer.Tick += ChartUpdateTimer_Tick;
+
+            // Activity Meter Timer
+            _activityDecayTimer.Interval = 100;
+            _activityDecayTimer.Tick += ActivityDecayTimer_Tick;
+            _activityDecayTimer.Start();
+        }
+
+        private void TimerForm_Load(object sender, EventArgs e)
+        {
+            // Load persisted timer settings
+            LoadSettings();
+
+            // Auto-reset the timer to the loaded values on startup
+            ResetTimerToInput();
+
+            // Programmatically position the Add Note button to guarantee correct placement.
+            btnAddNote.Top = txtNote.Bottom + 6; // 6 pixel gap below the text box.
         }
 
         #region Timer Logic
@@ -174,47 +122,45 @@ namespace WorkTimer
             {
                 if (_wasAutoPaused)
                 {
-                    ResumeTimer();
+                    ResumeTimer(autoResumed: true);
                 }
                 else if (_isManuallyPaused && (DateTime.Now - _manualPauseTime) > TimeSpan.FromSeconds(_manualPauseSecondsForAutoResume))
                 {
-                    ResumeTimer();
+                    ResumeTimer(autoResumed: false);
                 }
             }
         }
 
-        private void StartNewTimerSession()
+        private void StartNewSession()
         {
-            // If timer is at zero, set it from the input fields first
-            if (_remainingTime <= TimeSpan.Zero)
-            {
-                ResetTimerToInput();
-                // Don't start if the user set the time to zero.
-                if (_remainingTime <= TimeSpan.Zero) return;
-            }
+            ResetTimerToInput();
+            if (_remainingTime <= TimeSpan.Zero) return;
 
             // Clear data for the new session
             _activityData.Clear();
-            _absencePeriods.Clear();
+            _absences.Clear();
+            _logEntries.Clear();
             activityChart.Series["Activity"].Points.Clear();
-            _currentActivityLevel = 0;
-            _currentLog.Clear();
+            _currentLogFile = string.Empty;
 
-            // Create log entry for starting
-            string taskName = string.IsNullOrWhiteSpace(txtTaskName.Text) ? "Untitled Task" : txtTaskName.Text;
-            AddLogEntry("Session Start", $"Task: {taskName}");
-
-            ResumeTimer(); // Continue with common resume logic
+            AddLogEntry(LogEventType.Start, $"Timer started for task: {txtTaskName.Text}");
+            ResumeTimer(autoResumed: false, isNewSession: true);
         }
 
-        private void ResumeTimer()
+        private void ResumeTimer(bool autoResumed, bool isNewSession = false)
         {
-            // End the current absence period if there is one.
-            if (_currentAbsenceStart.HasValue)
+            if (!isNewSession)
             {
-                _absencePeriods.Add((_currentAbsenceStart.Value, DateTime.Now));
-                _currentAbsenceStart = null;
-                AddLogEntry("Active", "User activity resumed.");
+                string reason = autoResumed ? "auto-resumed due to activity" : "resumed by user";
+                AddLogEntry(LogEventType.Resume, $"Timer {reason}");
+                if (_absences.Any())
+                {
+                    var lastAbsence = _absences.Last();
+                    if (lastAbsence.End == DateTime.MaxValue)
+                    {
+                        _absences[^1] = (lastAbsence.Start, DateTime.Now); // Finalize the end time of the absence
+                    }
+                }
             }
 
             _isTimerRunning = true;
@@ -231,27 +177,6 @@ namespace WorkTimer
 
         private void PauseTimer(bool autoPaused = false)
         {
-            // Start tracking the absence period if we aren't already in one.
-            if (_currentAbsenceStart == null && _isTimerRunning)
-            {
-                if (autoPaused)
-                {
-                    // Refund the idle time back to the timer.
-                    _remainingTime = _remainingTime.Add(TimeSpan.FromSeconds(_idleSecondsForPause));
-                    progressRingPanel.Invalidate(); // Update the display immediately
-
-                    // Set the absence start time to when the user actually went idle.
-                    _currentAbsenceStart = DateTime.Now.Subtract(TimeSpan.FromSeconds(_idleSecondsForPause));
-                    AddLogEntry("Inactive", $"Auto-paused after {_idleSecondsForPause}s idle.");
-                }
-                else
-                {
-                    // For manual pauses, the absence starts now.
-                    _currentAbsenceStart = DateTime.Now;
-                    AddLogEntry("Paused", "Timer manually paused.");
-                }
-            }
-
             _isTimerRunning = false;
             btnPlayPause.Text = "Play";
 
@@ -259,24 +184,27 @@ namespace WorkTimer
             {
                 _wasAutoPaused = true;
                 lblStatus.Text = "Auto-Paused (Idle)";
+
+                // "Refund" the idle time
+                _remainingTime = _remainingTime.Add(TimeSpan.FromSeconds(_idleSecondsForPause));
+
+                // Accurately record when the absence began
+                var absenceStart = DateTime.Now.Subtract(TimeSpan.FromSeconds(_idleSecondsForPause));
+                _absences.Add((absenceStart, DateTime.MaxValue)); // Mark end time as max until resumed
+                AddLogEntry(LogEventType.Inactive, $"Auto-paused after {_idleSecondsForPause}s of inactivity.");
             }
             else
             {
                 _isManuallyPaused = true;
                 _manualPauseTime = DateTime.Now;
                 lblStatus.Text = "Paused";
+                _absences.Add((DateTime.Now, DateTime.MaxValue)); // Mark end time as max until resumed
+                AddLogEntry(LogEventType.Pause, "Timer paused by user.");
             }
         }
 
         private void StopTimer(bool isFinished)
         {
-            // End any ongoing absence period when the timer stops.
-            if (_currentAbsenceStart.HasValue)
-            {
-                _absencePeriods.Add((_currentAbsenceStart.Value, DateTime.Now));
-                _currentAbsenceStart = null;
-            }
-
             mainTimer.Stop();
             activityMonitorTimer.Stop();
             _chartUpdateTimer?.Stop();
@@ -288,23 +216,37 @@ namespace WorkTimer
             SetTimeControlsEnabled(true);
             txtTaskName.Enabled = true;
 
-
             if (isFinished)
             {
                 _remainingTime = TimeSpan.Zero;
                 progressRingPanel.Invalidate();
                 lblStatus.Text = "Time's up!";
-                AddLogEntry("Finished", "Timer completed.");
+                AddLogEntry(LogEventType.Finish, "Timer finished.");
                 SystemSounds.Exclamation.Play();
                 MessageBox.Show("Work session complete!", "Work Timer", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             else
             {
                 lblStatus.Text = "Stopped. Set time to begin.";
-                AddLogEntry("Stopped", "Timer manually stopped.");
+                AddLogEntry(LogEventType.Stop, "Timer stopped by user.");
             }
+            SaveLogFile();
+        }
 
-            SaveCurrentLog();
+        #endregion
+
+        #region Activity Meter
+        private void _activityHook_OnActivity(object? sender, GlobalActivityHook.ActivityEventArgs e)
+        {
+            if (e == null) return;
+            _activityScore += e.IsKeyboard ? KEYBOARD_WEIGHT : MOUSE_WEIGHT;
+        }
+
+        private void ActivityDecayTimer_Tick(object? sender, EventArgs e)
+        {
+            _activityScore *= ACTIVITY_DECAY_RATE;
+            if (_activityScore < 0.1) _activityScore = 0;
+            activityMeterPanel.Invalidate();
         }
 
         #endregion
@@ -319,14 +261,13 @@ namespace WorkTimer
             }
             else
             {
-                // If the timer has never run or was reset, start a new session. Otherwise, just resume.
-                if (Math.Abs(_remainingTime.TotalSeconds - _totalTime.TotalSeconds) < 1 || _totalTime.TotalSeconds == 0 || !_currentLog.Any())
+                if (!_logEntries.Any())
                 {
-                    StartNewTimerSession();
+                    StartNewSession();
                 }
                 else
                 {
-                    ResumeTimer();
+                    ResumeTimer(autoResumed: false);
                 }
             }
         }
@@ -339,25 +280,31 @@ namespace WorkTimer
 
         private void btnSettings_Click(object sender, EventArgs e)
         {
+            bool originalTopMost = this.TopMost;
             this.TopMost = false;
-            using (var settingsForm = new SettingsForm(_idleSecondsForPause, _manualPauseSecondsForAutoResume, _keyboardWeight, _typingSpeedForMax))
+            using (var settingsForm = new SettingsForm(_idleSecondsForPause, _manualPauseSecondsForAutoResume, _wpmForFullMeter, _opacityValue, originalTopMost))
             {
                 if (settingsForm.ShowDialog() == DialogResult.OK)
                 {
                     _idleSecondsForPause = settingsForm.IdleSeconds;
                     _manualPauseSecondsForAutoResume = settingsForm.ManualPauseSeconds;
-                    _keyboardWeight = settingsForm.KeyboardWeight;
-                    _typingSpeedForMax = settingsForm.TypingSpeedForMax;
+                    _wpmForFullMeter = settingsForm.Wpm;
+                    _opacityValue = settingsForm.OpacityValue;
+                    this.Opacity = _opacityValue / 100.0;
+                    this.TopMost = settingsForm.AlwaysOnTop;
+                }
+                else
+                {
+                    this.TopMost = originalTopMost;
                 }
             }
-            this.TopMost = true;
         }
 
         private void btnAddNote_Click(object sender, EventArgs e)
         {
             if (!string.IsNullOrWhiteSpace(txtNote.Text))
             {
-                AddLogEntry("Note", txtNote.Text.Trim());
+                AddLogEntry(LogEventType.Note, txtNote.Text);
                 txtNote.Clear();
             }
         }
@@ -372,12 +319,47 @@ namespace WorkTimer
             this.TopMost = true;
         }
 
+        private void btnManageAbsences_Click(object sender, EventArgs e)
+        {
+            this.TopMost = false;
+            var completedAbsences = _absences.Where(a => a.End != DateTime.MaxValue).ToList();
+
+            using (var absenceManager = new AbsenceManagerForm(completedAbsences))
+            {
+                if (absenceManager.ShowDialog() == DialogResult.OK)
+                {
+                    var absencesToRemove = absenceManager.AbsencesToRemove;
+                    if (absencesToRemove.Any())
+                    {
+                        foreach (var absenceToRemove in absencesToRemove)
+                        {
+                            var originalAbsence = _absences.FirstOrDefault(a => a.Start == absenceToRemove.Start && a.End == absenceToRemove.End);
+                            if (originalAbsence.Start != default)
+                            {
+                                _absences.Remove(originalAbsence);
+                                var duration = originalAbsence.End - originalAbsence.Start;
+
+                                // Subtract the time from the countdown to reflect the work done during the "absence"
+                                _remainingTime = _remainingTime.Subtract(duration);
+                                AddLogEntry(LogEventType.Note, $"Absence from {originalAbsence.Start:HH:mm:ss} to {originalAbsence.End:HH:mm:ss} removed. Time subtracted to reflect work done.");
+                            }
+                        }
+                        // Redraw the chart and progress ring to reflect the changes
+                        progressRingPanel.Invalidate();
+                        ChartUpdateTimer_Tick(null, EventArgs.Empty);
+                    }
+                }
+            }
+            this.TopMost = true;
+        }
+
         private void ResetTimerToInput()
         {
             _remainingTime = new TimeSpan((int)numHours.Value, (int)numMinutes.Value, (int)numSeconds.Value);
             _totalTime = _remainingTime;
             lblStatus.Text = "Ready to start";
             progressRingPanel.Invalidate();
+            SaveSettings(); // Save the new values whenever they are set
         }
 
         private void SetTimeControlsEnabled(bool isEnabled)
@@ -409,13 +391,22 @@ namespace WorkTimer
             chartArea.AxisX.IntervalType = DateTimeIntervalType.Minutes;
             chartArea.AxisX.MajorGrid.LineColor = Color.LightGray;
             chartArea.AxisX.Title = "Time";
+            chartArea.AxisX.IsMarginVisible = false;
+
+            // Fix for axis label flicker
+            chartArea.AxisX.Minimum = DateTime.Now.ToOADate();
+            chartArea.AxisX.Maximum = DateTime.Now.AddHours(1).ToOADate();
+
 
             chartArea.AxisY.MajorGrid.LineColor = Color.LightGray;
             chartArea.AxisY.Title = "Active Seconds";
-            chartArea.AxisY.Maximum = 60; // 1 minute * 60 seconds
+            chartArea.AxisY.Maximum = 60;
             chartArea.AxisY.Interval = 10;
+            chartArea.AxisY.IsMarginVisible = false;
 
             activityChart.Legends[0].Enabled = false;
+
+            activityChart.PostPaint += ActivityChart_PostPaint;
         }
 
         private void UpdateActivityData(bool isActive)
@@ -429,124 +420,69 @@ namespace WorkTimer
             {
                 _activityData[intervalStart] = 0;
             }
+
             _activityData[intervalStart]++;
         }
 
         private void ChartUpdateTimer_Tick(object? sender, EventArgs e)
         {
+            if (!_activityData.Any()) return;
+
             var series = activityChart.Series["Activity"];
-            var chartArea = activityChart.ChartAreas[0];
-
             series.Points.Clear();
-            chartArea.AxisX.StripLines.Clear();
 
-            // Add absence periods as semi-transparent grey bars
-            foreach (var absence in _absencePeriods)
-            {
-                var stripLine = new StripLine
-                {
-                    Interval = 0,
-                    IntervalOffset = absence.Start.ToOADate(),
-                    StripWidth = (absence.End - absence.Start).TotalDays,
-                    BackColor = Color.FromArgb(50, 128, 128, 128)
-                };
-                chartArea.AxisX.StripLines.Add(stripLine);
-            }
-
-            // Add the activity line data points
             foreach (var record in _activityData.OrderBy(kvp => kvp.Key))
             {
                 series.Points.AddXY(record.Key, record.Value);
             }
+
+            activityChart.ChartAreas[0].AxisX.Minimum = _activityData.Keys.Min().ToOADate();
+            activityChart.ChartAreas[0].AxisX.Maximum = DateTime.Now.ToOADate();
+
+            activityChart.Invalidate();
+        }
+
+        private void ActivityChart_PostPaint(object? sender, ChartPaintEventArgs e)
+        {
+            if (e.ChartElement is ChartArea chartArea)
+            {
+                var xAxis = chartArea.AxisX;
+                var yAxis = chartArea.AxisY;
+
+                RectangleF plotArea = chartArea.Position.ToRectangleF();
+                float plotX = plotArea.X * e.Chart.Width / 100f;
+                float plotY = plotArea.Y * e.Chart.Height / 100f;
+                float plotWidth = plotArea.Width * e.Chart.Width / 100f;
+                float plotHeight = plotArea.Height * e.Chart.Height / 100f;
+
+                using (var brush = new SolidBrush(Color.FromArgb(50, Color.Gray)))
+                {
+                    foreach (var (start, end) in _absences)
+                    {
+                        DateTime endTime = (end == DateTime.MaxValue) ? DateTime.Now : end;
+
+                        if (xAxis.Maximum < start.ToOADate() || xAxis.Minimum > endTime.ToOADate()) continue;
+
+                        double x1 = xAxis.ValueToPixelPosition(start.ToOADate());
+                        double x2 = xAxis.ValueToPixelPosition(endTime.ToOADate());
+                        double y1 = yAxis.ValueToPixelPosition(yAxis.Maximum);
+                        double y2 = yAxis.ValueToPixelPosition(yAxis.Minimum);
+
+                        x1 = Math.Max(x1, plotX);
+                        x2 = Math.Min(x2, plotX + plotWidth);
+
+                        if (x1 < x2)
+                        {
+                            e.ChartGraphics.Graphics.FillRectangle(brush, (float)x1, (float)y1, (float)(x2 - x1), (float)(y2 - y1));
+                        }
+                    }
+                }
+            }
         }
 
         #endregion
 
-        #region Activity Meter Logic
-
-        private void GlobalHook_OnActivity(object? sender, GlobalActivityHook.ActivityEventArgs e)
-        {
-            // Calculate the "max" activity level based on typing speed
-            // WPM -> Chars per second -> Activity units per second
-            double charsPerSecond = (_typingSpeedForMax * 5.0) / 60.0;
-            double maxActivityPerSecond = charsPerSecond * _keyboardWeight;
-
-            double activityAmount = 0;
-            if (e.ActivityType == GlobalActivityHook.ActivityType.Keyboard)
-            {
-                activityAmount = _keyboardWeight;
-            }
-            else if (e.ActivityType == GlobalActivityHook.ActivityType.Mouse)
-            {
-                // Give a small boost for mouse movement
-                activityAmount = 1;
-            }
-
-            // Normalize the activity boost
-            // A single keypress should contribute a fraction of the max level
-            _currentActivityLevel += (activityAmount / maxActivityPerSecond) * 100.0;
-
-            if (_currentActivityLevel > 100) _currentActivityLevel = 100;
-
-            activityMeterPanel.Invalidate();
-        }
-
-        private void ActivityDecayTimer_Tick(object? sender, EventArgs e)
-        {
-            // Decay the activity level over time
-            _currentActivityLevel *= 0.90; // Adjust for faster/slower decay
-            if (_currentActivityLevel < 0.1)
-            {
-                _currentActivityLevel = 0;
-            }
-            activityMeterPanel.Invalidate();
-        }
-
-        #endregion
-
-        #region Logging
-
-        private void AddLogEntry(string eventType, string? details = null)
-        {
-            var entry = new LogEntry(eventType, _remainingTime, details);
-            _currentLog.Add(entry);
-        }
-
-        private void SaveCurrentLog()
-        {
-            if (!_currentLog.Any()) return;
-
-            try
-            {
-                string logDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "WorkTimerLogs");
-                Directory.CreateDirectory(logDirectory);
-
-                string taskName = SanitizeFileName(string.IsNullOrWhiteSpace(txtTaskName.Text) ? "Untitled Task" : txtTaskName.Text);
-                string timestamp = _currentLog.First().Timestamp.ToString("yyyy-MM-dd_HH-mm-ss");
-                _currentLogFileName = Path.Combine(logDirectory, $"{timestamp}_{taskName}.log");
-
-                var logLines = _currentLog.Select(entry => entry.ToString()).ToList();
-                File.WriteAllLines(_currentLogFileName, logLines);
-
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Could not save log file.\n\nError: {ex.Message}", "Log Save Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private string SanitizeFileName(string fileName)
-        {
-            foreach (char c in Path.GetInvalidFileNameChars())
-            {
-                fileName = fileName.Replace(c, '_');
-            }
-            return fileName;
-        }
-
-        #endregion
-
-        #region Custom Drawing
+        #region Painting Methods
 
         private void progressRingPanel_Paint(object sender, PaintEventArgs e)
         {
@@ -587,52 +523,179 @@ namespace WorkTimer
         {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.Clear(this.BackColor);
 
-            Rectangle rect = activityMeterPanel.ClientRectangle;
-            g.Clear(Color.FromArgb(245, 245, 245));
+            int ledCount = 12;
+            int ledGap = 4;
+            int barWidth = activityMeterPanel.ClientSize.Width - 10;
+            int barX = 5;
 
-            int barCount = 12;
-            float barHeight = (float)rect.Height / barCount;
-            float spacing = barHeight * 0.2f;
+            int totalLedHeight = activityMeterPanel.ClientSize.Height - ((ledCount - 1) * ledGap);
+            int ledHeight = Math.Max(1, totalLedHeight / ledCount);
 
-            // Determine how many bars to light up
-            int barsToLight = (int)Math.Ceiling((_currentActivityLevel / 100.0) * barCount);
+            double maxScorePerTick = (_wpmForFullMeter * 5.0 / 60.0 * KEYBOARD_WEIGHT) / 10.0;
+            double maxReasonableScore = maxScorePerTick / (1 - ACTIVITY_DECAY_RATE);
+            double percentage = Math.Min(1.0, _activityScore / maxReasonableScore);
 
-            for (int i = 0; i < barCount; i++)
+            int ledsToLight = (int)(percentage * ledCount);
+
+            for (int i = 0; i < ledCount; i++)
             {
-                // Draw from bottom to top
-                float yPos = rect.Height - (i + 1) * barHeight + (spacing / 2);
-                RectangleF barRect = new RectangleF(0, yPos, rect.Width, barHeight - spacing);
+                int ledY = activityMeterPanel.ClientSize.Height - ((i + 1) * ledHeight) - (i * ledGap);
+                Rectangle ledRect = new Rectangle(barX, ledY, barWidth, ledHeight);
 
-                if (i < barsToLight)
+                Color ledColor;
+                if (i < ledsToLight)
                 {
-                    // Gradient color from green to red
-                    Color barColor = i < barCount * 0.5 ? Color.LawnGreen : (i < barCount * 0.8 ? Color.Orange : Color.Red);
-                    using (var brush = new SolidBrush(barColor))
-                    {
-                        g.FillRectangle(brush, barRect);
-                    }
+                    if (i < ledCount * 0.5)
+                        ledColor = Color.LimeGreen;
+                    else if (i < ledCount * 0.8)
+                        ledColor = Color.Gold;
+                    else
+                        ledColor = Color.Crimson;
                 }
                 else
                 {
-                    using (var brush = new SolidBrush(Color.FromArgb(220, 220, 220)))
-                    {
-                        g.FillRectangle(brush, barRect);
-                    }
+                    ledColor = Color.Gainsboro;
+                }
+
+                using (var brush = new SolidBrush(ledColor))
+                {
+                    g.FillRectangle(brush, ledRect);
                 }
             }
         }
+        #endregion
+
+        #region Logging & Settings Persistence
+
+        private void AddLogEntry(LogEventType type, string message)
+        {
+            _logEntries.Add(new LogEntry(type, message));
+        }
+
+        private void SaveLogFile()
+        {
+            if (!_logEntries.Any()) return;
+
+            string logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "WorkTimerLogs");
+            Directory.CreateDirectory(logDir);
+
+            if (string.IsNullOrEmpty(_currentLogFile))
+            {
+                string taskName = string.IsNullOrWhiteSpace(txtTaskName.Text) ? "Untitled" : txtTaskName.Text;
+                string safeTaskName = string.Join("_", taskName.Split(Path.GetInvalidFileNameChars()));
+                string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+                _currentLogFile = Path.Combine(logDir, $"{safeTaskName}_{timestamp}.log");
+            }
+
+            try
+            {
+                string json = JsonSerializer.Serialize(_logEntries, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(_currentLogFile, json);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Failed to save log file: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private string GetSettingsFilePath()
+        {
+            string appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            string appFolder = Path.Combine(appDataPath, "WorkTimer");
+            Directory.CreateDirectory(appFolder);
+            return Path.Combine(appFolder, "settings.json");
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                var settings = new AppSettings
+                {
+                    LastHours = (int)numHours.Value,
+                    LastMinutes = (int)numMinutes.Value,
+                    LastSeconds = (int)numSeconds.Value
+                };
+                string json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(GetSettingsFilePath(), json);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to save settings: {ex.Message}");
+            }
+        }
+
+        private void LoadSettings()
+        {
+            try
+            {
+                string filePath = GetSettingsFilePath();
+                if (File.Exists(filePath))
+                {
+                    string json = File.ReadAllText(filePath);
+                    var settings = JsonSerializer.Deserialize<AppSettings>(json);
+                    if (settings != null)
+                    {
+                        numHours.Value = settings.LastHours;
+                        numMinutes.Value = settings.LastMinutes;
+                        numSeconds.Value = settings.LastSeconds;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to load settings: {ex.Message}");
+            }
+        }
+
 
         #endregion
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            // Clean up the hook
-            _activityHook.Dispose();
-            // Save any pending log
-            SaveCurrentLog();
+            SaveSettings(); // Save current values on exit
+            _activityHook?.Dispose();
             base.OnFormClosing(e);
         }
+    }
+
+    public class AppSettings
+    {
+        public int LastHours { get; set; }
+        public int LastMinutes { get; set; }
+        public int LastSeconds { get; set; }
+    }
+
+
+    public class LogEntry
+    {
+        public DateTime Timestamp { get; set; }
+        public LogEventType EventType { get; set; }
+        public string Message { get; set; }
+
+        public LogEntry(LogEventType eventType, string message)
+        {
+            Timestamp = DateTime.Now;
+            EventType = eventType;
+            Message = message;
+        }
+        public LogEntry()
+        {
+            Message = string.Empty;
+        }
+    }
+
+    public enum LogEventType
+    {
+        Start,
+        Stop,
+        Pause,
+        Resume,
+        Inactive,
+        Note,
+        Finish
     }
 }
 
