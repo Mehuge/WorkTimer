@@ -7,15 +7,14 @@ namespace WorkTimer
 {
     public partial class AbsenceManagerForm : Form
     {
-        public List<(DateTime Start, DateTime End)> AbsencesToRemove { get; private set; }
+        private List<AbsencePeriod> _allAbsences;
+        public List<AbsencePeriod> AbsencesToRemove { get; private set; }
 
-        private List<(DateTime Start, DateTime End)> _allAbsences;
-
-        public AbsenceManagerForm(List<(DateTime Start, DateTime End)> absences)
+        public AbsenceManagerForm(List<AbsencePeriod> absences)
         {
             InitializeComponent();
             _allAbsences = absences;
-            AbsencesToRemove = new List<(DateTime Start, DateTime End)>();
+            AbsencesToRemove = new List<AbsencePeriod>();
         }
 
         private void AbsenceManagerForm_Load(object sender, EventArgs e)
@@ -29,23 +28,23 @@ namespace WorkTimer
 
         private void btnRemove_Click(object sender, EventArgs e)
         {
-            AbsencesToRemove.Clear();
-            foreach (int selectedIndex in lstAbsences.SelectedIndices)
+            if (lstAbsences.SelectedIndices.Count == 0)
             {
-                if (selectedIndex >= 0 && selectedIndex < _allAbsences.Count)
-                {
-                    AbsencesToRemove.Add(_allAbsences[selectedIndex]);
-                }
+                MessageBox.Show("Please select one or more absences to remove.", "No Selection", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
             }
 
-            if (AbsencesToRemove.Any())
+            var result = MessageBox.Show("Are you sure you want to remove the selected absence(s)? This will subtract the time from your countdown.", "Confirm Removal", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+
+            if (result == DialogResult.Yes)
             {
+                foreach (int index in lstAbsences.SelectedIndices.Cast<int>().OrderByDescending(i => i))
+                {
+                    AbsencesToRemove.Add(_allAbsences[index]);
+                }
+
                 this.DialogResult = DialogResult.OK;
                 this.Close();
-            }
-            else
-            {
-                MessageBox.Show("Please select at least one absence to remove.", "No Selection", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
         }
     }

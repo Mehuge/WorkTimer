@@ -8,35 +8,52 @@ namespace WorkTimer
         public int IdleSeconds { get; private set; }
         public int ManualPauseSeconds { get; private set; }
         public int Wpm { get; private set; }
-        public int OpacityValue { get; private set; }
         public bool AlwaysOnTop { get; private set; }
+        public double OpacityValue { get; private set; }
 
-
-        public SettingsForm(int idleSeconds, int manualPauseSeconds, int wpm, int opacityValue, bool alwaysOnTop)
+        public SettingsForm(int idleSeconds, int manualPauseSeconds, int wpm, bool alwaysOnTop, double opacity)
         {
             InitializeComponent();
-            numIdleTime.Value = idleSeconds;
-            numAutoResume.Value = manualPauseSeconds;
+
+            // Convert seconds to minutes for display
+            txtIdleTime.Text = (idleSeconds / 60).ToString();
+            txtAutoResume.Text = (manualPauseSeconds / 60).ToString();
             numWpm.Value = wpm;
-            opacityTrackBar.Value = opacityValue;
             chkAlwaysOnTop.Checked = alwaysOnTop;
+            opacityTrackBar.Value = (int)(opacity * 100);
+            lblOpacityValue.Text = $"{opacityTrackBar.Value}%";
         }
 
         private void btnOk_Click(object sender, EventArgs e)
         {
-            IdleSeconds = (int)numIdleTime.Value;
-            ManualPauseSeconds = (int)numAutoResume.Value;
+            // Validate Idle Time
+            if (!int.TryParse(txtIdleTime.Text, out int idleMinutes) || idleMinutes < 0)
+            {
+                MessageBox.Show("Please enter a valid whole number for the idle time.", "Invalid Input", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            // Validate Auto-Resume Time
+            if (!int.TryParse(txtAutoResume.Text, out int autoResumeMinutes) || autoResumeMinutes < 0)
+            {
+                MessageBox.Show("Please enter a valid whole number for the auto-resume time.", "Invalid Input", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            // Convert minutes back to seconds before saving
+            IdleSeconds = idleMinutes * 60;
+            ManualPauseSeconds = autoResumeMinutes * 60;
             Wpm = (int)numWpm.Value;
-            OpacityValue = opacityTrackBar.Value;
             AlwaysOnTop = chkAlwaysOnTop.Checked;
+            OpacityValue = opacityTrackBar.Value / 100.0;
+
             this.DialogResult = DialogResult.OK;
             this.Close();
         }
 
-        private void btnCancel_Click(object sender, EventArgs e)
+        private void opacityTrackBar_Scroll(object sender, EventArgs e)
         {
-            this.DialogResult = DialogResult.Cancel;
-            this.Close();
+            lblOpacityValue.Text = $"{opacityTrackBar.Value}%";
         }
     }
 }

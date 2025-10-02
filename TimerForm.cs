@@ -31,11 +31,12 @@ namespace WorkTimer
         private int _idleSecondsForPause = 300; // 5 minutes
         private int _manualPauseSecondsForAutoResume = 60; // 1 minute
         private int _wpmForFullMeter = 60;
-        private int _opacityValue = 100;
+        private AppSettings _appSettings = new AppSettings();
+
 
         // Charting & Absences
         private Dictionary<DateTime, int> _activityData = new Dictionary<DateTime, int>();
-        private List<(DateTime Start, DateTime End)> _absences = new List<(DateTime, DateTime)>();
+        private List<AbsencePeriod> _absences = new List<AbsencePeriod>();
         private System.Windows.Forms.Timer? _chartUpdateTimer;
 
         // Real-time Activity Meter
@@ -43,47 +44,180 @@ namespace WorkTimer
         private System.Windows.Forms.Timer _activityDecayTimer;
         private double _activityScore = 0;
         private const double MOUSE_WEIGHT = 0.5;
-        private const double KEYBOARD_WEIGHT = 5.0;
+        private const double KEYBOARD_WEIGHT = 5.0; // Keyboard is 10x more valuable
         private const double ACTIVITY_DECAY_RATE = 0.90;
+
+        // Alarm
+        private System.Windows.Forms.Timer? _alarmSequenceTimer;
+        private int _alarmCount = 0;
 
         #endregion
 
         public TimerForm()
         {
+            // REVERTED to original, stable order
             InitializeComponent();
             _activityDecayTimer = new System.Windows.Forms.Timer();
-            InitializeCustomComponents();
             _activityHook = new GlobalActivityHook();
             _activityHook.OnActivity += _activityHook_OnActivity;
+
+            LoadSettings();
+            InitializeCustomComponents();
+            RestoreSession();
         }
 
         private void InitializeCustomComponents()
         {
+            // Form properties are now set in LoadSettings to ensure they are applied correctly on startup
+            this.Text = "Work Timer";
+
             // Chart setup
             SetupActivityChart();
 
+            // Initial state from settings (will be overridden by session if it exists)
+            numHours.Value = _appSettings.LastHours;
+            numMinutes.Value = _appSettings.LastMinutes;
+            numSeconds.Value = _appSettings.LastSeconds;
+            ResetTimerToInput();
+
+
             // Chart update timer
             _chartUpdateTimer = new System.Windows.Forms.Timer();
-            _chartUpdateTimer.Interval = 5000;
+            _chartUpdateTimer.Interval = 5000; // Update chart every 5 seconds
             _chartUpdateTimer.Tick += ChartUpdateTimer_Tick;
 
             // Activity Meter Timer
-            _activityDecayTimer.Interval = 100;
+            _activityDecayTimer.Interval = 100; // Decay activity score 10 times per second
             _activityDecayTimer.Tick += ActivityDecayTimer_Tick;
             _activityDecayTimer.Start();
+
+            // Alarm Timer
+            _alarmSequenceTimer = new System.Windows.Forms.Timer();
+            _alarmSequenceTimer.Interval = 1000; // 1 second
+            _alarmSequenceTimer.Tick += AlarmSequenceTimer_Tick;
         }
 
-        private void TimerForm_Load(object sender, EventArgs e)
+        #region Session and Settings Persistence
+
+        private string GetAppDataPath()
         {
-            // Load persisted timer settings
-            LoadSettings();
-
-            // Auto-reset the timer to the loaded values on startup
-            ResetTimerToInput();
-
-            // Programmatically position the Add Note button to guarantee correct placement.
-            btnAddNote.Top = txtNote.Bottom + 6; // 6 pixel gap below the text box.
+            string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "WorkTimer");
+            Directory.CreateDirectory(path);
+            return path;
         }
+
+        private void LoadSettings()
+        {
+            string settingsPath = Path.Combine(GetAppDataPath(), "settings.json");
+            try
+            {
+                if (File.Exists(settingsPath))
+                {
+                    string json = File.ReadAllText(settingsPath);
+                    _appSettings = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+                }
+            }
+            catch
+            {
+                // Handle corrupted settings file by resetting to defaults
+                _appSettings = new AppSettings();
+            }
+
+            // Apply settings, ensuring valid values to prevent invisible window
+            this.TopMost = _appSettings.AlwaysOnTop;
+            this.Opacity = Math.Max(0.2, _appSettings.Opacity); // Ensure opacity is at least 20%
+        }
+
+        private void SaveSettings()
+        {
+            _appSettings.LastHours = (int)numHours.Value;
+            _appSettings.LastMinutes = (int)numMinutes.Value;
+            _appSettings.LastSeconds = (int)numSeconds.Value;
+
+            string settingsPath = Path.Combine(GetAppDataPath(), "settings.json");
+            try
+            {
+                string json = JsonSerializer.Serialize(_appSettings, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(settingsPath, json);
+            }
+            catch { /* Silently fail if settings can't be saved */ }
+        }
+
+        private void RestoreSession()
+        {
+            string sessionPath = Path.Combine(GetAppDataPath(), "session.json");
+            if (File.Exists(sessionPath))
+            {
+                try
+                {
+                    string json = File.ReadAllText(sessionPath);
+                    var state = JsonSerializer.Deserialize<SessionState>(json);
+
+                    if (state != null)
+                    {
+                        // Restore all state
+                        _remainingTime = state.RemainingTime;
+                        _totalTime = state.TotalTime;
+                        txtTaskName.Text = state.TaskName;
+                        _activityData = state.ActivityData;
+                        _absences = state.Absences;
+                        _logEntries = state.LogEntries;
+                        _currentLogFile = state.LogFile;
+
+                        // Calculate downtime and add as an absence only if it exceeds the idle threshold
+                        var downtime = DateTime.Now - state.ExitTime;
+                        if (downtime.TotalSeconds > _idleSecondsForPause)
+                        {
+                            _absences.Add(new AbsencePeriod { Start = state.ExitTime, End = DateTime.Now });
+                            AddLogEntry(LogEventType.Note, $"Application was closed for {downtime:hh\\:mm\\:ss}.");
+                        }
+
+                        // Resume the timer
+                        ResumeTimer(autoResumed: false, isNewSession: false);
+
+                        // Update chart view and redraw immediately
+                        ChartUpdateTimer_Tick(null, EventArgs.Empty);
+
+                        File.Delete(sessionPath); // Clean up session file
+                        return; // Skip default reset
+                    }
+                }
+                catch
+                {
+                    // If session restore fails, delete the corrupt file and start fresh
+                    File.Delete(sessionPath);
+                }
+            }
+            // If no session file exists or restore failed, reset to last used values
+            ResetTimerToInput();
+        }
+
+        private void SaveSession()
+        {
+            if (!_isTimerRunning) return;
+
+            var state = new SessionState
+            {
+                RemainingTime = _remainingTime,
+                TotalTime = _totalTime,
+                TaskName = txtTaskName.Text,
+                ActivityData = _activityData,
+                Absences = _absences,
+                LogEntries = _logEntries,
+                LogFile = _currentLogFile,
+                ExitTime = DateTime.Now
+            };
+
+            string sessionPath = Path.Combine(GetAppDataPath(), "session.json");
+            try
+            {
+                string json = JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(sessionPath, json);
+            }
+            catch { /* Silently fail */ }
+        }
+
+        #endregion
 
         #region Timer Logic
 
@@ -133,6 +267,7 @@ namespace WorkTimer
 
         private void StartNewSession()
         {
+            StopAlarm();
             ResetTimerToInput();
             if (_remainingTime <= TimeSpan.Zero) return;
 
@@ -143,12 +278,19 @@ namespace WorkTimer
             activityChart.Series["Activity"].Points.Clear();
             _currentLogFile = string.Empty;
 
+            // Set initial chart view
+            var chartArea = activityChart.ChartAreas[0];
+            chartArea.AxisX.Minimum = DateTime.Now.ToOADate();
+            chartArea.AxisX.Maximum = DateTime.Now.AddMinutes(10).ToOADate();
+
+
             AddLogEntry(LogEventType.Start, $"Timer started for task: {txtTaskName.Text}");
             ResumeTimer(autoResumed: false, isNewSession: true);
         }
 
         private void ResumeTimer(bool autoResumed, bool isNewSession = false)
         {
+            StopAlarm();
             if (!isNewSession)
             {
                 string reason = autoResumed ? "auto-resumed due to activity" : "resumed by user";
@@ -158,7 +300,7 @@ namespace WorkTimer
                     var lastAbsence = _absences.Last();
                     if (lastAbsence.End == DateTime.MaxValue)
                     {
-                        _absences[^1] = (lastAbsence.Start, DateTime.Now); // Finalize the end time of the absence
+                        _absences[^1] = new AbsencePeriod { Start = lastAbsence.Start, End = DateTime.Now }; // Finalize the end time of the absence
                     }
                 }
             }
@@ -190,7 +332,7 @@ namespace WorkTimer
 
                 // Accurately record when the absence began
                 var absenceStart = DateTime.Now.Subtract(TimeSpan.FromSeconds(_idleSecondsForPause));
-                _absences.Add((absenceStart, DateTime.MaxValue)); // Mark end time as max until resumed
+                _absences.Add(new AbsencePeriod { Start = absenceStart, End = DateTime.MaxValue }); // Mark end time as max until resumed
                 AddLogEntry(LogEventType.Inactive, $"Auto-paused after {_idleSecondsForPause}s of inactivity.");
             }
             else
@@ -198,7 +340,7 @@ namespace WorkTimer
                 _isManuallyPaused = true;
                 _manualPauseTime = DateTime.Now;
                 lblStatus.Text = "Paused";
-                _absences.Add((DateTime.Now, DateTime.MaxValue)); // Mark end time as max until resumed
+                _absences.Add(new AbsencePeriod { Start = DateTime.Now, End = DateTime.MaxValue }); // Mark end time as max until resumed
                 AddLogEntry(LogEventType.Pause, "Timer paused by user.");
             }
         }
@@ -220,10 +362,12 @@ namespace WorkTimer
             {
                 _remainingTime = TimeSpan.Zero;
                 progressRingPanel.Invalidate();
-                lblStatus.Text = "Time's up!";
+                lblStatus.Text = "Time's up! Click Reset to stop alarm.";
                 AddLogEntry(LogEventType.Finish, "Timer finished.");
-                SystemSounds.Exclamation.Play();
-                MessageBox.Show("Work session complete!", "Work Timer", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+                // Start alarm sequence
+                _alarmCount = 0;
+                _alarmSequenceTimer?.Start();
             }
             else
             {
@@ -231,11 +375,15 @@ namespace WorkTimer
                 AddLogEntry(LogEventType.Stop, "Timer stopped by user.");
             }
             SaveLogFile();
+
+            // Clean up session file on clean stop/reset
+            string sessionPath = Path.Combine(GetAppDataPath(), "session.json");
+            if (File.Exists(sessionPath)) File.Delete(sessionPath);
         }
 
         #endregion
 
-        #region Activity Meter
+        #region Activity and Alarm Methods
         private void _activityHook_OnActivity(object? sender, GlobalActivityHook.ActivityEventArgs e)
         {
             if (e == null) return;
@@ -249,9 +397,34 @@ namespace WorkTimer
             activityMeterPanel.Invalidate();
         }
 
+        private void AlarmSequenceTimer_Tick(object? sender, EventArgs e)
+        {
+            SystemSounds.Exclamation.Play();
+            _alarmCount++;
+            if (_alarmCount >= 10)
+            {
+                StopAlarm();
+            }
+        }
+
+        private void StopAlarm()
+        {
+            _alarmSequenceTimer?.Stop();
+            _alarmCount = 0;
+            if (lblStatus.Text.StartsWith("Time's up!"))
+            {
+                lblStatus.Text = "Finished";
+            }
+        }
+
         #endregion
 
         #region UI Handlers & Methods
+
+        private void TimerForm_Load(object sender, EventArgs e)
+        {
+            btnAddNote.Location = new Point(txtNote.Right - btnAddNote.Width, txtNote.Bottom + 5);
+        }
 
         private void btnPlayPause_Click(object sender, EventArgs e)
         {
@@ -274,30 +447,43 @@ namespace WorkTimer
 
         private void btnReset_Click(object sender, EventArgs e)
         {
+            StopAlarm();
             StopTimer(isFinished: false);
             ResetTimerToInput();
+
+            // Clear activity data and update the chart
+            _activityData.Clear();
+            _absences.Clear();
+            activityChart.Series["Activity"].Points.Clear();
+
+            // Reset chart view to default
+            var chartArea = activityChart.ChartAreas[0];
+            chartArea.AxisX.Minimum = DateTime.Now.ToOADate();
+            chartArea.AxisX.Maximum = DateTime.Now.AddHours(1).ToOADate();
+
+            activityChart.Invalidate();
         }
 
         private void btnSettings_Click(object sender, EventArgs e)
         {
-            bool originalTopMost = this.TopMost;
             this.TopMost = false;
-            using (var settingsForm = new SettingsForm(_idleSecondsForPause, _manualPauseSecondsForAutoResume, _wpmForFullMeter, _opacityValue, originalTopMost))
+            using (var settingsForm = new SettingsForm(_idleSecondsForPause, _manualPauseSecondsForAutoResume, _wpmForFullMeter, _appSettings.AlwaysOnTop, _appSettings.Opacity))
             {
                 if (settingsForm.ShowDialog() == DialogResult.OK)
                 {
                     _idleSecondsForPause = settingsForm.IdleSeconds;
                     _manualPauseSecondsForAutoResume = settingsForm.ManualPauseSeconds;
                     _wpmForFullMeter = settingsForm.Wpm;
-                    _opacityValue = settingsForm.OpacityValue;
-                    this.Opacity = _opacityValue / 100.0;
-                    this.TopMost = settingsForm.AlwaysOnTop;
-                }
-                else
-                {
-                    this.TopMost = originalTopMost;
+                    _appSettings.AlwaysOnTop = settingsForm.AlwaysOnTop;
+                    _appSettings.Opacity = settingsForm.OpacityValue;
+
+                    // Apply settings immediately
+                    this.TopMost = _appSettings.AlwaysOnTop;
+                    this.Opacity = _appSettings.Opacity;
+                    SaveSettings();
                 }
             }
+            this.TopMost = _appSettings.AlwaysOnTop; // Re-apply in case dialog was cancelled
         }
 
         private void btnAddNote_Click(object sender, EventArgs e)
@@ -316,7 +502,7 @@ namespace WorkTimer
             {
                 logBrowser.ShowDialog();
             }
-            this.TopMost = true;
+            this.TopMost = _appSettings.AlwaysOnTop;
         }
 
         private void btnManageAbsences_Click(object sender, EventArgs e)
@@ -337,20 +523,18 @@ namespace WorkTimer
                             if (originalAbsence.Start != default)
                             {
                                 _absences.Remove(originalAbsence);
-                                var duration = originalAbsence.End - originalAbsence.Start;
 
-                                // Subtract the time from the countdown to reflect the work done during the "absence"
+                                // Subtract time from countdown
+                                var duration = originalAbsence.End - originalAbsence.Start;
                                 _remainingTime = _remainingTime.Subtract(duration);
-                                AddLogEntry(LogEventType.Note, $"Absence from {originalAbsence.Start:HH:mm:ss} to {originalAbsence.End:HH:mm:ss} removed. Time subtracted to reflect work done.");
+                                AddLogEntry(LogEventType.Note, $"Absence from {originalAbsence.Start:HH:mm:ss} to {originalAbsence.End:HH:mm:ss} removed. Time subtracted from countdown.");
                             }
                         }
-                        // Redraw the chart and progress ring to reflect the changes
-                        progressRingPanel.Invalidate();
                         ChartUpdateTimer_Tick(null, EventArgs.Empty);
                     }
                 }
             }
-            this.TopMost = true;
+            this.TopMost = _appSettings.AlwaysOnTop;
         }
 
         private void ResetTimerToInput()
@@ -359,7 +543,6 @@ namespace WorkTimer
             _totalTime = _remainingTime;
             lblStatus.Text = "Ready to start";
             progressRingPanel.Invalidate();
-            SaveSettings(); // Save the new values whenever they are set
         }
 
         private void SetTimeControlsEnabled(bool isEnabled)
@@ -376,6 +559,7 @@ namespace WorkTimer
         private void SetupActivityChart()
         {
             activityChart.Series.Clear();
+
             var series = new Series("Activity")
             {
                 ChartType = SeriesChartType.Line,
@@ -386,17 +570,14 @@ namespace WorkTimer
             activityChart.Series.Add(series);
 
             var chartArea = activityChart.ChartAreas[0];
+            // REVERTED to original, stable styling
             chartArea.BackColor = Color.FromArgb(245, 245, 245);
+
             chartArea.AxisX.LabelStyle.Format = "HH:mm";
             chartArea.AxisX.IntervalType = DateTimeIntervalType.Minutes;
             chartArea.AxisX.MajorGrid.LineColor = Color.LightGray;
             chartArea.AxisX.Title = "Time";
             chartArea.AxisX.IsMarginVisible = false;
-
-            // Fix for axis label flicker
-            chartArea.AxisX.Minimum = DateTime.Now.ToOADate();
-            chartArea.AxisX.Maximum = DateTime.Now.AddHours(1).ToOADate();
-
 
             chartArea.AxisY.MajorGrid.LineColor = Color.LightGray;
             chartArea.AxisY.Title = "Active Seconds";
@@ -405,7 +586,6 @@ namespace WorkTimer
             chartArea.AxisY.IsMarginVisible = false;
 
             activityChart.Legends[0].Enabled = false;
-
             activityChart.PostPaint += ActivityChart_PostPaint;
         }
 
@@ -426,18 +606,22 @@ namespace WorkTimer
 
         private void ChartUpdateTimer_Tick(object? sender, EventArgs e)
         {
-            if (!_activityData.Any()) return;
-
             var series = activityChart.Series["Activity"];
             series.Points.Clear();
 
-            foreach (var record in _activityData.OrderBy(kvp => kvp.Key))
+            if (!_activityData.Any()) return;
+
+            var chartArea = activityChart.ChartAreas[0];
+            var orderedData = _activityData.OrderBy(kvp => kvp.Key).ToList();
+
+            foreach (var record in orderedData)
             {
                 series.Points.AddXY(record.Key, record.Value);
             }
 
-            activityChart.ChartAreas[0].AxisX.Minimum = _activityData.Keys.Min().ToOADate();
-            activityChart.ChartAreas[0].AxisX.Maximum = DateTime.Now.ToOADate();
+            // Dynamically adjust the X-axis to keep the graph current.
+            chartArea.AxisX.Minimum = orderedData.First().Key.ToOADate();
+            chartArea.AxisX.Maximum = DateTime.Now.AddMinutes(1).ToOADate(); // Show 1 minute into the future
 
             activityChart.Invalidate();
         }
@@ -455,15 +639,14 @@ namespace WorkTimer
                 float plotWidth = plotArea.Width * e.Chart.Width / 100f;
                 float plotHeight = plotArea.Height * e.Chart.Height / 100f;
 
+
                 using (var brush = new SolidBrush(Color.FromArgb(50, Color.Gray)))
                 {
-                    foreach (var (start, end) in _absences)
+                    foreach (var absence in _absences)
                     {
-                        DateTime endTime = (end == DateTime.MaxValue) ? DateTime.Now : end;
+                        DateTime endTime = (absence.End == DateTime.MaxValue) ? DateTime.Now : absence.End;
 
-                        if (xAxis.Maximum < start.ToOADate() || xAxis.Minimum > endTime.ToOADate()) continue;
-
-                        double x1 = xAxis.ValueToPixelPosition(start.ToOADate());
+                        double x1 = xAxis.ValueToPixelPosition(absence.Start.ToOADate());
                         double x2 = xAxis.ValueToPixelPosition(endTime.ToOADate());
                         double y1 = yAxis.ValueToPixelPosition(yAxis.Maximum);
                         double y2 = yAxis.ValueToPixelPosition(yAxis.Minimum);
@@ -567,7 +750,7 @@ namespace WorkTimer
         }
         #endregion
 
-        #region Logging & Settings Persistence
+        #region Logging
 
         private void AddLogEntry(LogEventType type, string message)
         {
@@ -578,7 +761,7 @@ namespace WorkTimer
         {
             if (!_logEntries.Any()) return;
 
-            string logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "WorkTimerLogs");
+            string logDir = Path.Combine(GetAppDataPath(), "WorkTimerLogs");
             Directory.CreateDirectory(logDir);
 
             if (string.IsNullOrEmpty(_currentLogFile))
@@ -600,74 +783,18 @@ namespace WorkTimer
             }
         }
 
-        private string GetSettingsFilePath()
-        {
-            string appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            string appFolder = Path.Combine(appDataPath, "WorkTimer");
-            Directory.CreateDirectory(appFolder);
-            return Path.Combine(appFolder, "settings.json");
-        }
-
-        private void SaveSettings()
-        {
-            try
-            {
-                var settings = new AppSettings
-                {
-                    LastHours = (int)numHours.Value,
-                    LastMinutes = (int)numMinutes.Value,
-                    LastSeconds = (int)numSeconds.Value
-                };
-                string json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(GetSettingsFilePath(), json);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Failed to save settings: {ex.Message}");
-            }
-        }
-
-        private void LoadSettings()
-        {
-            try
-            {
-                string filePath = GetSettingsFilePath();
-                if (File.Exists(filePath))
-                {
-                    string json = File.ReadAllText(filePath);
-                    var settings = JsonSerializer.Deserialize<AppSettings>(json);
-                    if (settings != null)
-                    {
-                        numHours.Value = settings.LastHours;
-                        numMinutes.Value = settings.LastMinutes;
-                        numSeconds.Value = settings.LastSeconds;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Failed to load settings: {ex.Message}");
-            }
-        }
-
-
         #endregion
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            SaveSettings(); // Save current values on exit
+            SaveSettings();
+            SaveSession();
             _activityHook?.Dispose();
             base.OnFormClosing(e);
         }
     }
 
-    public class AppSettings
-    {
-        public int LastHours { get; set; }
-        public int LastMinutes { get; set; }
-        public int LastSeconds { get; set; }
-    }
-
+    #region Data Structures
 
     public class LogEntry
     {
@@ -689,13 +816,36 @@ namespace WorkTimer
 
     public enum LogEventType
     {
-        Start,
-        Stop,
-        Pause,
-        Resume,
-        Inactive,
-        Note,
-        Finish
+        Start, Stop, Pause, Resume, Inactive, Note, Finish
     }
+
+    public struct AbsencePeriod
+    {
+        public DateTime Start { get; set; }
+        public DateTime End { get; set; }
+    }
+
+    public class AppSettings
+    {
+        public int LastHours { get; set; } = 0;
+        public int LastMinutes { get; set; } = 25;
+        public int LastSeconds { get; set; } = 0;
+        public bool AlwaysOnTop { get; set; } = true;
+        public double Opacity { get; set; } = 1.0;
+    }
+
+    public class SessionState
+    {
+        public TimeSpan RemainingTime { get; set; }
+        public TimeSpan TotalTime { get; set; }
+        public string TaskName { get; set; } = string.Empty;
+        public Dictionary<DateTime, int> ActivityData { get; set; } = new Dictionary<DateTime, int>();
+        public List<AbsencePeriod> Absences { get; set; } = new List<AbsencePeriod>();
+        public List<LogEntry> LogEntries { get; set; } = new List<LogEntry>();
+        public string LogFile { get; set; } = string.Empty;
+        public DateTime ExitTime { get; set; }
+    }
+
+    #endregion
 }
 
